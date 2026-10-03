@@ -12,7 +12,7 @@ def generate_cypher(question: str, owner_id: str, project_id: str) -> str:
     
     GRAPH SCHEMA:
     - Nodes: (File), (Function), (Entity)
-    - Properties: name, summary, owner_id, project_id, summary_embedding
+    - Properties: name, chunk, owner_id, project_id, embedding
     - Relationships: (File)-[:CONTAINS]->(Function), (Function)-[:CALLS]->(Entity), (File)-[:CALLS]->(Entity)
     
     SEARCH STRATEGY:
@@ -21,18 +21,18 @@ def generate_cypher(question: str, owner_id: str, project_id: str) -> str:
     CHOOSE EXACTLY ONE OF THE FOLLOWING TEMPLATES BASED ON THE USER'S QUESTION:
     
     OPTION 1 (Basic Search - Use for general questions about what the project does):
-    CALL db.index.vector.queryNodes('file_summary_index', 10, $question_vector)
+    CALL db.index.vector.queryNodes('entity_embedding_index', 10, $question_vector)
     YIELD node, score
     WHERE node.owner_id = '{owner_id}' AND node.project_id = '{project_id}'
-    RETURN labels(node)[0] AS Type, node.name AS Name, node.summary AS Summary, score
+    RETURN labels(node)[0] AS Type, node.name AS Name, node.chunk AS Chunk, score
     ORDER BY score DESC
     
     OPTION 2 (Dependency Search - Use if user asks about dependencies, tech stack, or function calls):
-    CALL db.index.vector.queryNodes('file_summary_index', 3, $question_vector)
+    CALL db.index.vector.queryNodes('entity_embedding_index', 3, $question_vector)
     YIELD node, score
     WHERE node.owner_id = '{owner_id}' AND node.project_id = '{project_id}'
     MATCH (node)-[:CONTAINS|CALLS*1..2]-(related)
-    RETURN labels(node)[0] AS Type, node.name AS Name, node.summary AS Summary, 
+    RETURN labels(node)[0] AS Type, node.name AS Name, node.chunk AS Chunk, 
            collect(DISTINCT related.name) AS RelatedEntities, score
     ORDER BY score DESC
     
@@ -71,9 +71,9 @@ def generate_cypher(question: str, owner_id: str, project_id: str) -> str:
         print(f"Error generating Cypher query: {e}")
         # Fallback safe query if the API call completely fails
         return f"""
-        CALL db.index.vector.queryNodes('file_summary_index', 5, $question_vector)
+        CALL db.index.vector.queryNodes('entity_embedding_index', 5, $question_vector)
         YIELD node, score
         WHERE node.owner_id = '{owner_id}' AND node.project_id = '{project_id}'
-        RETURN labels(node)[0] AS Type, node.name AS Name, node.summary AS Summary, score
+        RETURN labels(node)[0] AS Type, node.name AS Name, node.chunk AS Chunk, score
         ORDER BY score DESC
         """

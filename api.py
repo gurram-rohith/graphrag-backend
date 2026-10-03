@@ -12,10 +12,9 @@ from neo4j import GraphDatabase
 from openai import OpenAI
 from fastapi.responses import StreamingResponse
 
-
 app = FastAPI()
 
-# Enable CORS for React frontend (Updated to allow Vercel deployment)
+# Enable CORS for React frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,7 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ADD THIS:
+# Global Nvidia API Client for Embeddings and Completions
 print("Initializing Nvidia API Client...")
 nvidia_client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
@@ -67,54 +66,54 @@ def run_background_pipeline(url: str, owner_id: str, project_id: str):
     
     temp_dir = None
     try:
-        # 1. Clone into an isolated directory (This will throw ValueError if over 200 files)
+        # 1. Clone into isolated directory
         file_list, temp_dir = ingest.ingest_repository(url)
         print(f"DEBUG: Clone successful. Total logic files detected: {len(file_list)}")
         
-        # 2. Resolve Relative Paths to Absolute Paths immediately
-        absolute_file_list = []
-        for f in file_list:
-            if os.path.isabs(f):
-                absolute_file_list.append(f)
-            else:
-                absolute_file_list.append(os.path.abspath(os.path.join(temp_dir, f)))
+        # 2. Resolve relative paths to absolute paths
+        absolute_file_list = [
+            f if os.path.isabs(f) else os.path.abspath(os.path.join(temp_dir, f))
+            for f in file_list
+        ]
         
-        # 3. Clean Slate and Setup Vector Index
+        # 3. Clean Project Data and Ensure Vector Index
         driver = GraphDatabase.driver(config.URI, auth=(config.USER, config.PASSWORD))
         with driver.session() as session:
-            # Wipe old data
-            # Wipe old data
+            # Drop obsolete index from previous migrations if still present
+            session.run("DROP INDEX file_summary_index IF EXISTS")
+
+            # Wipe only data for this owner and project
             session.run("""
-                MATCH (n:Entity {owner_id: $owner_id, project_id: $project_id}) 
+                MATCH (n:Entity {owner_id: $owner_id, project_id:$project_id}) 
                 DETACH DELETE n
             """, owner_id=owner_id, project_id=project_id)
             
-            # DROP the old 384-dimension index if it exists so we don't get a mismatch error
-            session.run("DROP INDEX file_summary_index IF EXISTS")
-            
-            # CREATE the new 1024-dimension index for Nvidia's model
+            # Ensure entity vector index exists without destroying it on every run
             session.run("""
-            CREATE VECTOR INDEX file_summary_index IF NOT EXISTS
-            FOR (f:File)
-            ON (f.summary_embedding)
-            OPTIONS {indexConfig: {
-             `vector.dimensions`: 2048,
-             `vector.similarity_function`: 'cosine'
-            }}
+                CREATE VECTOR INDEX entity_embedding_index IF NOT EXISTS
+                FOR (e:Entity)
+                ON (e.embedding)
+                OPTIONS {indexConfig: {
+                    `vector.dimensions`: 2048,
+                    `vector.similarity_function`: 'cosine'
+                }}
             """)
         driver.close()
         
-        # 4. Parses and embeds structural nodes using the absolute path mapping
+        # 4. Parse and embed AST chunks
         print(f"DEBUG: Passing {len(absolute_file_list)} absolute file paths into parser...")
         result = parser.run_parsing_pipeline(absolute_file_list, owner_id, project_id)
         print(f"DEBUG: Parsing process completed. Results generated: {result}")
         
+        processed_count = result.get("processed", 0)
+        error_count = result.get("errors", 0)
+
         ingestion_status = {
-            "status": "completed",
+            "status": "completed" if processed_count > 0 else "failed",
             "url": url,
-            "processed_files": result.get("processed", 0),
-            "errors": result.get("errors", 0),
-            "error_message": None if result.get("processed", 0) > 0 else "No compatible source files found."
+            "processed_files": processed_count,
+            "errors": error_count,
+            "error_message": None if processed_count > 0 else "No compatible source files could be parsed."
         }
     except Exception as e:
         print(f"ERROR: Exception caught in background thread: {str(e)}")
@@ -122,11 +121,11 @@ def run_background_pipeline(url: str, owner_id: str, project_id: str):
             "status": "failed",
             "url": url,
             "processed_files": 0,
-            "errors": 0,
+            "errors": 1,
             "error_message": str(e)
         }
     finally:
-        # 5. GUARANTEED WIPE: Clean disk memory space safely
+        # 5. Clean disk memory safely
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, onerror=ingest.force_remove_readonly)
             print(f"DEBUG: Wiped temp file directory execution branch at: {temp_dir}")
@@ -157,7 +156,7 @@ async def query_knowledge_graph(request: QueryRequest):
         response = nvidia_client.embeddings.create(
             input=request.question,
             model=config.NVIDIA_EMBEDDING_MODEL,
-            extra_body={"input_type": "query"} # "query" tells Nvidia this is a search question
+            extra_body={"input_type": "query"}
         )
         question_vector = response.data[0].embedding
     except Exception as e:
@@ -190,10 +189,6 @@ async def query_knowledge_graph(request: QueryRequest):
     except Exception as e:
         context = f"Error executing Cypher query in Neo4j: {str(e)}"
 
-    client = OpenAI(
-        base_url="https://integrate.api.nvidia.com/v1",
-        api_key=config.NVIDIA_API_KEY
-    )
     prompt = f"""
     You are an expert GraphRAG AI code assistant. Answer the user's question based on the retrieved code structure context from the Neo4j knowledge graph.
     
@@ -208,23 +203,18 @@ async def query_knowledge_graph(request: QueryRequest):
 
     async def stream_generator():
         try:
-            print("DEBUG: Requesting stream from Nvidia...")
-            stream = client.chat.completions.create(
+            stream = nvidia_client.chat.completions.create(
                 model=config.NVIDIA_CHAT_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
                 stream=True
             )
             
-            chunk_count = 0
             for chunk in stream:
                 if chunk.choices[0].delta.content is not None:
-                    chunk_count += 1
                     word_chunk = {"chunk": chunk.choices[0].delta.content}
                     yield json.dumps(word_chunk) + "\n"
-            
-            print(f"DEBUG: Stream finished. Sent {chunk_count} word chunks to React.")
-            
+                    
         except Exception as e:
             print(f"DEBUG: Nvidia Stream Error: {str(e)}")
             yield json.dumps({"response": f"\n\nFailed to stream response: {str(e)}"}) + "\n"
@@ -235,11 +225,10 @@ async def query_knowledge_graph(request: QueryRequest):
 
 @app.get("/api/callers/{function_name}")
 async def get_who_calls_this(function_name: str, project_id: str, owner_id: str = "rohith_gurram"):
-    """Finds all functions in a specific project that CALL the target function."""
     query = """
-    MATCH (caller:Entity {owner_id: $owner_id, project_id: $project_id})
+    MATCH (caller:Entity {owner_id: $owner_id, project_id:$project_id})
           -[:CALLS]->
-          (callee:Entity {name: $func_name, owner_id: $owner_id, project_id: $project_id})
+          (callee:Entity {name: $func_name, owner_id: $owner_id, project_id:$project_id})
     RETURN caller.name AS caller
     """
     try:
@@ -248,18 +237,16 @@ async def get_who_calls_this(function_name: str, project_id: str, owner_id: str 
             result = session.run(query, owner_id=owner_id, project_id=project_id, func_name=function_name)
             callers = [record["caller"] for record in result]
         driver.close()
-        
         return {"function": function_name, "project_id": project_id, "callers": callers}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database connection error: {str(e)}")
 
 @app.get("/api/callees/{function_name}")
 async def get_what_this_calls(function_name: str, project_id: str, owner_id: str = "rohith_gurram"):
-    """Finds all functions that are CALLED BY the target function within a specific project."""
     query = """
-    MATCH (caller:Entity {name: $func_name, owner_id: $owner_id, project_id: $project_id})
+    MATCH (caller:Entity {name: $func_name, owner_id: $owner_id, project_id:$project_id})
           -[:CALLS]->
-          (callee:Entity {owner_id: $owner_id, project_id: $project_id})
+          (callee:Entity {owner_id: $owner_id, project_id:$project_id})
     RETURN callee.name AS callee
     """
     try:
@@ -268,7 +255,6 @@ async def get_what_this_calls(function_name: str, project_id: str, owner_id: str
             result = session.run(query, owner_id=owner_id, project_id=project_id, func_name=function_name)
             callees = [record["callee"] for record in result]
         driver.close()
-        
         return {"function": function_name, "project_id": project_id, "callees": callees}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database connection error: {str(e)}")

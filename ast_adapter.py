@@ -1,4 +1,3 @@
-# ast_adapter.py
 from tree_sitter import Parser, Language, Query, QueryCursor
 import tree_sitter_javascript as ts_js
 import tree_sitter_python as ts_python
@@ -6,32 +5,35 @@ import tree_sitter_java as ts_java
 import tree_sitter_c as ts_c
 import tree_sitter_cpp as ts_cpp
 
-# 1. Configuration Dictionary
-# This maps file extensions to their specific language bindings and syntax queries.
 LANGUAGE_MAP = {
     ".js": {
         "lang": ts_js.language(),
-        "query": "(call_expression function: (identifier) @call_name)",
+        "call_query": "(call_expression function: (identifier) @call_name)",
+        "func_query": "(function_declaration name: (identifier) @func_name) @func_body",
         "func_types": ["function_declaration", "arrow_function", "function"]
     },
     ".py": {
         "lang": ts_python.language(),
-        "query": "(call function: (identifier) @call_name)",
+        "call_query": "(call function: (identifier) @call_name)",
+        "func_query": "(function_definition name: (identifier) @func_name) @func_body",
         "func_types": ["function_definition"]
     },
     ".java": {
         "lang": ts_java.language(),
-        "query": "(method_invocation name: (identifier) @call_name)",
+        "call_query": "(method_invocation name: (identifier) @call_name)",
+        "func_query": "(method_declaration name: (identifier) @func_name) @func_body",
         "func_types": ["method_declaration"]
     },
     ".c": {
         "lang": ts_c.language(),
-        "query": "(call_expression function: (identifier) @call_name)",
+        "call_query": "(call_expression function: (identifier) @call_name)",
+        "func_query": "(function_definition declarator: (function_declarator declarator: (identifier) @func_name)) @func_body",
         "func_types": ["function_definition"]
     },
     ".cpp": {
         "lang": ts_cpp.language(),
-        "query": "(call_expression function: (identifier) @call_name)",
+        "call_query": "(call_expression function: (identifier) @call_name)",
+        "func_query": "(function_definition declarator: (function_declarator declarator: (identifier) @func_name)) @func_body",
         "func_types": ["function_definition"]
     }
 }
@@ -44,11 +46,10 @@ class UniversalParser:
         config = LANGUAGE_MAP[ext]
         self.language = Language(config["lang"])
         self.parser = Parser(self.language)
-        self.query_string = config["query"]
+        self.call_query_string = config["call_query"]
         self.func_types = config["func_types"]
 
     def _get_parent_func_name(self, node):
-        """Generic parent traversal using the configured function types."""
         current = node.parent
         while current:
             if current.type in self.func_types:
@@ -58,30 +59,61 @@ class UniversalParser:
             current = current.parent
         return "global"
 
-    def extract_calls(self, source_code):
+    def parse_file(self, source_code: str, file_name: str):
         """
-        Returns a clean Python list of tuples: [('caller_func', 'callee_func')]
-        No tree-sitter objects leak out of this function.
+        Parses source code to return structured function chunks and call edges.
         """
         tree = self.parser.parse(bytes(source_code, "utf8"))
-        query = Query(self.language, self.query_string)
-        cursor = QueryCursor(query)
-        results = cursor.captures(tree.root_node)
         
-        extracted_calls = []
+        # 1. Extract Call Edges
+        call_query = Query(self.language, self.call_query_string)
+        call_cursor = QueryCursor(call_query)
+        call_results = call_cursor.captures(tree.root_node)
         
-        if isinstance(results, dict):
-            nodes_to_process = results.get("call_name", [])
+        calls = []
+        if isinstance(call_results, dict):
+            nodes_to_process = call_results.get("call_name", [])
         else:
-            nodes_to_process = [item[0] for item in results if isinstance(item, tuple) and item[1] == "call_name"]
+            nodes_to_process = [item[0] for item in call_results if isinstance(item, tuple) and item[1] == "call_name"]
 
-        if not isinstance(nodes_to_process, list):
-            nodes_to_process = [nodes_to_process]
-
-        for node in nodes_to_process:
+        for node in (nodes_to_process if isinstance(nodes_to_process, list) else [nodes_to_process]):
             if not node: continue
             call_name = node.text.decode("utf8")
             parent_func = self._get_parent_func_name(node)
-            extracted_calls.append((parent_func, call_name))
-            
-        return extracted_calls
+            calls.append({"caller": parent_func, "callee": call_name})
+
+        # 2. Extract Function Chunks (Name + Logic Snippet)
+        functions = []
+        # Fallback to traversing the tree manually for functions to ensure broad capture
+        def walk_tree(node):
+            if node.type in self.func_types:
+                name_node = node.child_by_field_name("name")
+                func_name = name_node.text.decode("utf8") if name_node else "anonymous"
+                # Extract up to the first 500 chars of the function as the structural chunk
+                raw_text = node.text.decode("utf8")[:500] 
+                
+                # Assemble the human-readable AST chunk for the embedding model
+                chunk_text = (
+                    f"Type: Function\n"
+                    f"File: {file_name}\n"
+                    f"Name: {func_name}\n"
+                    f"Logic Snippet:\n{raw_text}..."
+                )
+                
+                functions.append({
+                    "name": func_name,
+                    "chunk_text": chunk_text
+                })
+            for child in node.children:
+                walk_tree(child)
+                
+        walk_tree(tree.root_node)
+        
+        # Also create a file-level structural chunk
+        file_chunk = (
+            f"Type: Source File\n"
+            f"File: {file_name}\n"
+            f"Contains Functions: {', '.join([f['name'] for f in functions])}"
+        )
+
+        return file_chunk, functions, calls
