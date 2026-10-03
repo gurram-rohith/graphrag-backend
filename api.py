@@ -19,7 +19,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000", # For local testing
-        "https://graphrag-frontend-qyhv5eo1e-hackme2.vercel.app", # Your current Vercel preview URL
+        "https://graphrag-frontend-qyhv5eo1e-hackme2.vercel.app",
+        "http://localhost:5173" # Your current Vercel preview URL
         # Add your main/production Vercel URL here as well if it differs from the preview URL
     ],
     allow_credentials=True,
