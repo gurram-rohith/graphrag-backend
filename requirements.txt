@@ -5,3 +5,11 @@ GitPython
 neo4j
 openai
 python-dotenv
+tree-sitter==0.21.3
+tree-sitter-javascript
+tree-sitter-python
+tree-sitter-java
+tree-sitter-c
+tree-sitter-cpp
+neo4j
+sentence-transformers
