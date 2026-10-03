@@ -4,6 +4,7 @@ neo4j
 openai
 pydantic
 gitpython
+python-dotenv
 tree-sitter==0.25.2
 tree-sitter-javascript
 tree-sitter-python
